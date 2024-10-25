@@ -26,9 +26,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Contact
 
-Erbil Can Artun
-TÜBİTAK, Research Institute for Fundamental Sciences
-Kadir Has University, Faculty of Natural Sciences and Engineering
+Erbil Can Artun  
+TÜBİTAK, Research Institute for Fundamental Sciences  
+Kadir Has University, Faculty of Natural Sciences and Engineering  
 <can.artun@tubitak.gov.tr>, <can.artun@khas.edu.tr>
 
 ***Note**: This research is in progress. Methods, results, and documentation are being actively developed and may change significantly.*
