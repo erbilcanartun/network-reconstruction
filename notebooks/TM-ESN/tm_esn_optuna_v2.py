@@ -59,10 +59,14 @@ from optuna.storages.journal import JournalFileBackend
 # ==========================================================
 # CONFIG
 # ==========================================================
-DATA_PATH = Path("../../data/chaotic_data/lorenz_system.csv")  # adjust if needed
+DATA_PATH = Path("../../data/chaotic_data/rulkov_map.csv")  # adjust if needed
 STUDY_NAME = "tm_esn_rulkov_v2"
 JOURNAL_PATH = "./tm_esn_optuna_journal_v2.log"
 RESULTS_DIR = Path("./tm_esn_results_v2")
+# Cross-process stop flag. Touching this file makes every worker exit
+# after its current trial finishes. Workers remove it on startup so old
+# flags don't poison new sessions.
+STOP_FLAG_PATH = "./tm_esn_stop_flag"
 
 TRAIN_LEN_FULL = 20_000      # used for final retrain
 TRAIN_LEN_SEARCH = 10_000    # used during Optuna search (much faster fit)
@@ -613,11 +617,28 @@ def make_objective():
 # ==========================================================
 # RUN STUDY
 # ==========================================================
+def _stop_flag_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
+    """Optuna calls this after every completed trial. If the stop flag has
+    appeared, request the optimize loop to exit. study.stop() works here
+    because we are inside the optimize() call, on the worker's own thread.
+    """
+    if os.path.exists(STOP_FLAG_PATH):
+        print(f"\n[PID {os.getpid()}] Stop flag detected; "
+              f"exiting after this trial.")
+        study.stop()
+
+
 def run_study(n_trials: int, n_jobs: int, fresh: bool):
     RESULTS_DIR.mkdir(exist_ok=True)
     if fresh and os.path.exists(JOURNAL_PATH):
         os.remove(JOURNAL_PATH)
         print(f"Removed old journal: {JOURNAL_PATH}")
+
+    # Always clear a stale stop flag at startup. Without this, a flag left
+    # over from a previous session would immediately stop the new worker.
+    if os.path.exists(STOP_FLAG_PATH):
+        os.remove(STOP_FLAG_PATH)
+        print(f"Cleared stale stop flag: {STOP_FLAG_PATH}")
 
     storage = JournalStorage(JournalFileBackend(JOURNAL_PATH))
     # Worker-specific seed so multiple parallel processes explore distinct
@@ -659,8 +680,13 @@ def run_study(n_trials: int, n_jobs: int, fresh: bool):
     print(f"Worker PID {os.getpid()}, sampler seed {sampler_seed}")
     print(f"Running {n_trials} trials with n_jobs={n_jobs}")
     t0 = time.time()
-    study.optimize(make_objective(), n_trials=n_trials, n_jobs=n_jobs,
-                   show_progress_bar=False)
+    study.optimize(
+        make_objective(),
+        n_trials=n_trials,
+        n_jobs=n_jobs,
+        show_progress_bar=False,
+        callbacks=[_stop_flag_callback],
+    )
     print(f"\nElapsed: {time.time() - t0:.1f}s")
     return study
 
@@ -883,24 +909,44 @@ def status(plot_convergence: bool = True):
 def request_stop():
     """Ask all workers to stop AFTER their current trial finishes.
 
-    This sets study.stop() which Optuna checks between trials. Currently-
-    running trials complete normally and their results ARE saved. Workers
-    then exit on their own.
+    Implementation: writes a small flag file at STOP_FLAG_PATH. Each
+    worker has registered a callback that runs after every trial; the
+    callback checks for this file and calls study.stop() if it exists.
+    Currently-running trials complete normally and their results are
+    saved. Workers then exit on their own and clean up the flag file.
 
-    Use this instead of Ctrl+C when you want to keep every completed trial.
+    Use this instead of Ctrl+C when you want to keep every completed
+    trial. To cancel a stop request before any worker has noticed it,
+    delete STOP_FLAG_PATH manually.
     """
-    study = _load_existing_study()
-    study.stop()
-    print("Stop signal sent. Workers will exit after their current trial.")
-    print("Wait until terminals show 'Elapsed: ...s' before calling")
+    Path(STOP_FLAG_PATH).touch()
+    print(f"Stop flag written: {STOP_FLAG_PATH}")
+    print("Workers will exit after their current trial completes.")
+    print("Wait until each terminal prints 'Elapsed: ...s' before calling")
     print("final_report() to get the validated best model.")
+
+
+def cancel_stop_request():
+    """Delete the stop flag file, in case you changed your mind before any
+    worker noticed it. Has no effect on workers that already saw the flag
+    and are exiting."""
+    if os.path.exists(STOP_FLAG_PATH):
+        os.remove(STOP_FLAG_PATH)
+        print(f"Removed stop flag: {STOP_FLAG_PATH}")
+    else:
+        print("No stop flag is currently set.")
 
 
 def final_report(validate_k: int = 5):
     """Print the report, validate the top-k configs at full T with all seeds,
     plot the validation winner and save to PNG. Use this AFTER all workers
     have stopped (either via Ctrl+C, request_stop(), or natural completion).
+
+    Also removes the stop flag file if it was left behind by request_stop(),
+    so subsequent worker runs aren't immediately interrupted.
     """
+    if os.path.exists(STOP_FLAG_PATH):
+        os.remove(STOP_FLAG_PATH)
     study = _load_existing_study()
     report(study)
     if len(study.trials) > 0 and study.best_value is not None:
